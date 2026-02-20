@@ -2,88 +2,145 @@ import network
 import urequests
 import ujson
 import utime
-import machine
 from machine import I2C, Pin
 import lcd
 
-i2c = machine.I2C(0, scl=machine.Pin(1), sda=machine.Pin(0))
-LCD = lcd.Lcd_i2c(i2c, cols=16, rows=2)
-LCD.clear()
+# LCD setup
+i2c = I2C(0, scl=Pin(1), sda=Pin(0))
+display = lcd.Lcd_i2c(i2c, cols=16, rows=2)
+display.clear()
+
+# ---------------- CONFIG ---------------- #
+
 def load_config():
-    with open("CONFIGURATION.txt", "r") as f:
-        return ujson.load(f)
+    try:
+        with open("credentials.txt", "r") as f:
+            return ujson.load(f)
+    except Exception as e:
+        print("Config error:", e)
+        display.write("Config Error")
+        return None
 
 
-def connect_wifi(ssid, password):
+# ---------------- WIFI ---------------- #
+
+def connect_wifi(ssid, password=None):
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    if not wlan.isconnected():
-        wlan.connect(ssid, password)
-        
-        # Timeout pro připojení (cca 10s)
-        attempt = 0
-        while not wlan.isconnected() and attempt < 20:
-            utime.sleep(0.5)
-            attempt += 1
-    
+    wlan.connect(ssid)
+
+    timeout = 15
+    while not wlan.isconnected() and timeout > 0:
+        display.clear()
+        display.write("Connecting WiFi")
+        print("Connecting WiFi...")
+        utime.sleep(1)
+        timeout -= 1
+
     if wlan.isconnected():
-        return True
+        ip = wlan.ifconfig()[0]
+        display.clear()
+        display.write("WiFi OK\n" + ip)
+        print("Connected:", ip)
+        utime.sleep(2)
+        return wlan
     else:
-        return False
-    
+        display.clear()
+        display.write("WiFi Failed!")
+        print("WiFi failed")
+        return None
+
+
+# ---------------- LOCATION ---------------- #
+
 def get_location():
     try:
-        # IP-API nevyžaduje klíč
         res = urequests.get("http://ip-api.com/json/")
         data = res.json()
         res.close()
-        return data['lat'], data['lon'], data['city']
-    except Exception:
-        return None, None, "error"
-    
+        return data["lat"], data["lon"], data["city"]
+    except:
+        return None, None, "LOC ERR"
+
+
+# ---------------- WEATHER ---------------- #
+# Use HTTP to avoid SSL memory crashes
+
 def get_weather(lat, lon, api_key):
     try:
-        url = "https://api.openweathermap.org/data/2.5/weather?lat={}&lon={}&appid={}&units=metric".format(lat, lon, api_key)
+        url = "http://api.openweathermap.org/data/2.5/weather?lat={}&lon={}&appid={}&units=metric".format(lat, lon, api_key)
         res = urequests.get(url)
         if res.status_code == 200:
             data = res.json()
             res.close()
             return data
         res.close()
-    except:
-        pass
+    except Exception as e:
+        print("Weather error:", e)
     return None
 
+
+# ---------------- LCD UPDATE ---------------- #
+
 def update_display(city, weather_data):
-    LCD.clear()
+    display.clear()
+
     if weather_data:
-        temp = weather_data['main']['temp']
-        desc = weather_data['weather'][0]['main']
-        hum = weather_data['main']['humidity']
-        LCD.write("{}: {}C".format(city, temp))
-        LCD.set_cursor(0, 1)
-        LCD.write("{} Hum:{}%".format(desc, hum))
+        temp = weather_data["main"]["temp"]
+        hum = weather_data["main"]["humidity"]
+        desc = weather_data["weather"][0]["main"]
+
+        # Trim text for 16x2 LCD
+        city = city[:8]
+        desc = desc[:8]
+
+        display.write("{} {}C".format(city, temp))
+        display.set_cursor(0, 1)
+        display.write("{} {}%".format(desc, hum))
     else:
-        LCD.write("Weather Data\nError")
+        display.write("Weather Error")
+
+
+# ---------------- MAIN ---------------- #
 
 config = load_config()
-last_update = -60000
-lat, lon, city = None, None, None
+if not config:
+    raise SystemExit
 
-if config:
-    while True:
-        wlan = network.WLAN(network.STA_IF)
+ssid = config["ssid"]
+password = config["password"]
+api_key = config["api_key"]
 
-        if not wlan.isconnected():
-            if not connect_wifi(config['ssid'], config['password']):
-                utime.sleep(5)
-                continue
-        
-        current_time = utime.ticks_ms()
-        if utime.ticks_diff(current_time, last_update) >= 600000:
-            if lat is None:
-                lat, lon, city = get_location()
-                if lat:
-                    LCD.clear()
-                    LCD.write("Loc: {},{}\n{}".format(lat, lon, city))
-                    utime.sleep(3)
+wlan = connect_wifi(ssid, password)
+if not wlan:
+    raise SystemExit
+
+# Get location once
+lat, lon, city = get_location()
+if lat is None:
+    display.clear()
+    display.write("Loc Failed")
+    city = "Unknown"
+else:
+    display.clear()
+    display.write("Loc OK\n" + city)
+    utime.sleep(2)
+
+last_update = 0
+
+# Main loop
+while True:
+    now = utime.ticks_ms()
+
+    # Update every 10 minutes
+    if utime.ticks_diff(now, last_update) > 600000:
+        print("Updating weather...")
+        data = get_weather(lat, lon, api_key)
+        update_display(city, data)
+        last_update = now
+
+    # Auto reconnect WiFi
+    if not wlan.isconnected():
+        connect_wifi(ssid, password)
+
+    utime.sleep(1)
